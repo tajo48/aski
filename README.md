@@ -70,8 +70,8 @@ cargo build --release
 Nix:
 
 ```sh
-nix run .        # not runnable as-is; install instead:
-nix build .      # result/bin/aski
+nix run github:tajo48/aski   # one-off
+nix profile install github:tajo48/aski
 ```
 
 The flake wraps the binary with `wayland`, `libxkbcommon`, `libGL` and
