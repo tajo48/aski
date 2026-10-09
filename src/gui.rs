@@ -3,13 +3,25 @@
 //!
 //! Keyboard: ↑/↓ move the option cursor, Enter commits the current question
 //! (custom text > highlighted option > ticked options) and advances, Esc cancels.
+//!
+//! Visual concept: a quiet full-bleed menu list, not a web form — a thin
+//! progress bar for multi-question runs, an uppercase topic label over the
+//! question, plain rows whose selection is shown by an accent radio/checkbox
+//! and label color, and one nav row at the bottom. Type scale: 10/12/15/18.
 
 use crate::spec::{Answer, AnswerStatus, PopupSpec, Question, QuestionAnswer};
 use crate::theme;
+use iced::alignment::Vertical;
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
 use iced::{keyboard, time, window, Border, Element, Length, Size, Subscription, Task, Theme};
 use std::io::Write;
 use std::time::Duration;
+
+/// Window width; rows and the progress bar derive from it.
+const WIN_W: f32 = 400.0;
+const PAD_X: f32 = 20.0;
+/// Usable content width (window minus horizontal padding).
+const CONTENT_W: f32 = WIN_W - 2.0 * PAD_X;
 
 pub fn run_popup() {
     match try_run_popup() {
@@ -69,8 +81,9 @@ struct Popup {
     states: Vec<QuestionState>,
     /// Index of the question currently on screen.
     current: usize,
-    /// Keyboard-focused option within the current question.
-    cursor: usize,
+    /// Keyboard-focused option within the current question. Cleared on mouse
+    /// clicks — the plate highlight is a keyboard aid, not a selection state.
+    cursor: Option<usize>,
     input_id: text_input::Id,
     remaining: Option<u64>,
 }
@@ -96,7 +109,7 @@ impl Popup {
             palette,
             states,
             current: 0,
-            cursor: 0,
+            cursor: None,
             input_id,
             remaining,
         }
@@ -112,6 +125,20 @@ impl Popup {
 
     fn state_mut(&mut self) -> &mut QuestionState {
         &mut self.states[self.current]
+    }
+
+    fn topic_label(&self) -> String {
+        let n = self.spec.questions.len();
+        let header = self.spec.questions[self.current]
+            .header
+            .clone()
+            .unwrap_or_else(|| "Decision needed".into())
+            .to_uppercase();
+        if n > 1 {
+            format!("{header}  ·  {} / {}", self.current + 1, n)
+        } else {
+            header
+        }
     }
 
     /// Resolve the final selections for question `idx`: custom text wins, then
@@ -131,11 +158,21 @@ impl Popup {
             .map(|(i, _)| q.options[i].label.clone())
             .collect();
         if !ticked.is_empty() {
+            // Multi-select: a typed note is returned IN ADDITION to the ticked
+            // options, as its own entry — it never replaces them. (Single-select
+            // has at most one tick, and an explicit custom answer wins.)
+            if !custom.is_empty() {
+                let mut all = ticked;
+                all.push(custom.to_string());
+                return all;
+            }
             return ticked;
         }
         if !q.multi_select {
-            if let Some(opt) = q.options.get(self.cursor) {
-                return vec![opt.label.clone()];
+            if let Some(cursor) = self.cursor {
+                if let Some(opt) = q.options.get(cursor) {
+                    return vec![opt.label.clone()];
+                }
             }
         }
         vec![]
@@ -170,12 +207,13 @@ fn write_answer(answer: Answer) {
 fn update(popup: &mut Popup, message: Message) -> Task<Message> {
     match message {
         Message::Select(i) => {
-            // Single-select: clicking highlights the option; Next/Enter commits.
+            // Single-select: clicking marks the option; Next/Enter commits.
+            // The cursor highlight is keyboard-only, so clear it here.
             if popup.question().options.get(i).is_some() {
                 for (j, slot) in popup.state_mut().selected.iter_mut().enumerate() {
                     *slot = j == i;
                 }
-                popup.cursor = i;
+                popup.cursor = None;
             }
             Task::none()
         }
@@ -183,18 +221,19 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             if let Some(slot) = popup.state_mut().selected.get_mut(i) {
                 *slot = value;
             }
-            popup.cursor = i;
+            popup.cursor = None;
             Task::none()
         }
         Message::MoveCursor(delta) => {
             let max = popup.question().options.len().saturating_sub(1);
-            popup.cursor = (popup.cursor as i32 + delta).clamp(0, max as i32) as usize;
+            let base = popup.cursor.map_or(0, |c| c as i32);
+            popup.cursor = Some((base + delta).clamp(0, max as i32) as usize);
             Task::none()
         }
         Message::Back => {
             if popup.current > 0 {
                 popup.current -= 1;
-                popup.cursor = 0;
+                popup.cursor = None;
             }
             Task::none()
         }
@@ -214,7 +253,7 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
                 });
             }
             popup.current += 1;
-            popup.cursor = 0;
+            popup.cursor = None;
             Task::none()
         }
         Message::OtherChanged(value) => {
@@ -241,177 +280,75 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
     }
 }
 
+// --------------------------------------------------------------------- view
+
 fn view(popup: &Popup) -> Element<'_, Message> {
     let p = popup.palette;
     let n = popup.spec.questions.len();
     let q = popup.question();
     let st = popup.state();
     let last = popup.current + 1 == n;
-    let mut col = column![].spacing(12).width(Length::Fill);
 
-    // Top bar: topic chips when there are several questions, plain header otherwise.
+    let mut col = column![].spacing(14).width(Length::Fill);
+
     if n > 1 {
-        let mut tabs = row![].spacing(6);
-        for (i, qq) in popup.spec.questions.iter().enumerate() {
-            let label = qq
-                .header
-                .clone()
-                .unwrap_or_else(|| format!("q{}", i + 1))
-                .to_uppercase();
-            let is_cur = i == popup.current;
-            tabs = tabs.push(
-                container(
-                    text(label)
-                        .size(11)
-                        .color(if is_cur { p.accent } else { p.overlay0 }),
-                )
-                .padding(4)
-                .style(move |_| container::Style {
-                    background: Some(if is_cur { p.surface0 } else { p.mantle }.into()),
-                    border: Border {
-                        radius: 5.0.into(),
-                        width: 1.0,
-                        color: if is_cur { p.accent } else { p.surface1 },
-                    },
-                    ..Default::default()
-                }),
-            );
-        }
-        col = col.push(tabs);
-    } else {
-        col = col.push(
-            text(
-                q.header
-                    .as_deref()
-                    .unwrap_or("Decision needed")
-                    .to_uppercase(),
-            )
-            .size(12)
-            .color(p.accent),
-        );
+        col = col.push(progress_bar(p, popup.current, n));
     }
 
+    col = col.push(text(popup.topic_label()).size(11).color(p.accent));
     col = col.push(
-        container(text(q.question.clone()).size(17).color(p.text))
+        container(text(q.question.clone()).size(16).color(p.text))
             .width(Length::Fill)
-            .padding(4),
+            .padding([0, 1]),
     );
 
-    let mut options = column![].spacing(8);
+    let mut options = column![].spacing(2).width(Length::Fill);
     for (i, opt) in q.options.iter().enumerate() {
         let is_selected = st.selected[i];
-        let is_cursor = popup.cursor == i;
+        let is_cursor = popup.cursor == Some(i);
         if q.multi_select {
-            let mut opt_col = column![].spacing(2);
-            opt_col = opt_col.push(
-                checkbox(opt.label.clone(), is_selected)
-                    .on_toggle(move |checked| Message::Toggle(i, checked))
-                    .size(18)
-                    .text_size(14)
-                    .style(move |_theme, _status| checkbox::Style {
-                        background: p.surface0.into(),
-                        icon_color: p.accent,
-                        border: Border {
-                            radius: 5.0.into(),
-                            width: 1.0,
-                            color: p.surface2,
-                        },
-                        text_color: Some(p.text),
-                    }),
-            );
-            if let Some(desc) = &opt.description {
-                opt_col = opt_col.push(
-                    text(desc.clone())
-                        .size(12)
-                        .color(p.overlay1)
-                        .width(Length::Fill),
-                );
-            }
-            options = options.push(container(opt_col).width(Length::Fill).padding(6).style(
-                move |_| container::Style {
-                    background: Some(if is_selected { p.surface0 } else { p.mantle }.into()),
-                    border: Border {
-                        radius: 6.0.into(),
-                        width: if is_cursor { 1.0 } else { 0.0 },
-                        color: p.accent,
-                    },
-                    ..Default::default()
-                },
-            ));
+            options = options.push(multi_row(p, i, opt, is_selected, is_cursor));
         } else {
-            let mut label_col = column![].spacing(2);
-            label_col = label_col.push(text(opt.label.clone()).size(14).color(p.text));
-            if let Some(desc) = &opt.description {
-                label_col = label_col.push(text(desc.clone()).size(12).color(p.overlay1));
-            }
-            options = options.push(
-                button(container(label_col).padding(8).width(Length::Fill))
-                    .on_press(Message::Select(i))
-                    .width(Length::Fill)
-                    .style(move |_theme, status| option_style(p, status, is_selected, is_cursor)),
-            );
+            options = options.push(single_row(p, i, opt, is_selected, is_cursor));
         }
     }
-    col = col.push(scrollable(options).height(Length::Shrink));
+    col = col.push(
+        container(scrollable(options))
+            .width(Length::Fill)
+            .height(Length::Shrink),
+    );
 
-    // Preview of the focused option (code sample, mockup, diff, …).
-    if let Some(preview) = q.options.get(popup.cursor).and_then(|o| o.preview.clone()) {
-        col = col.push(
-            container(scrollable(text(preview).size(12).color(p.subtext0)).height(Length::Fill))
-                .width(Length::Fill)
-                .height(150)
-                .padding(8)
-                .style(move |_| container::Style {
-                    background: Some(p.mantle.into()),
-                    border: Border {
-                        radius: 6.0.into(),
-                        width: 1.0,
-                        color: p.surface1,
-                    },
-                    ..Default::default()
-                }),
-        );
+    if let Some(preview) = popup
+        .cursor
+        .and_then(|c| q.options.get(c))
+        .and_then(|o| o.preview.clone())
+    {
+        col = col.push(preview_panel(p, preview));
     }
 
     col = col.push(
-        text_input("Other… (free-form answer)", &st.other)
+        text_input("Other… free-form answer", &st.other)
             .id(popup.input_id.clone())
             .on_input(Message::OtherChanged)
             .on_submit(Message::Next)
             .size(13)
-            .padding(8)
+            .padding([8, 12])
             .width(Length::Fill)
             .style(move |_theme, status| text_input_style(p, status)),
     );
 
-    let nav = row![
-        button(text("Back").size(13).color(p.subtext0))
-            .on_press_maybe((popup.current > 0).then_some(Message::Back))
-            .padding([8, 14])
-            .style(move |_theme, status| option_style(p, status, false, false)),
-        button(
-            container(
-                text(if last { "Submit" } else { "Next" })
-                    .size(14)
-                    .color(p.crust)
-            )
-            .padding(8)
-            .width(Length::Fill)
-            .center_x(Length::Fill)
-        )
-        .on_press(Message::Next)
-        .width(Length::Fill)
-        .style(move |_theme, status| confirm_style(p, status)),
-    ]
-    .spacing(8);
-    col = col.push(nav);
+    // Push the nav row (and countdown) to the bottom edge, whatever the
+    // height estimate left over.
+    col = col.push(container(text("")).height(Length::Fill));
+
+    col = col.push(nav_bar(p, popup.current > 0, last));
 
     if let Some(secs) = popup.remaining {
         col = col.push(
             container(
                 text(format!("closes in {secs}s"))
-                    .size(11)
-                    .color(p.overlay1),
+                    .size(10)
+                    .color(p.overlay0),
             )
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -421,7 +358,7 @@ fn view(popup: &Popup) -> Element<'_, Message> {
     container(col)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(18)
+        .padding([18, PAD_X as u16])
         .style(move |_theme| container::Style {
             background: Some(p.base.into()),
             ..Default::default()
@@ -429,31 +366,261 @@ fn view(popup: &Popup) -> Element<'_, Message> {
         .into()
 }
 
-fn option_style(
+/// Thin progress line for multi-question runs: accent fill grows per question.
+fn progress_bar(p: theme::Palette, current: usize, total: usize) -> Element<'static, Message> {
+    let fraction = (current + 1) as f32 / total as f32;
+    let fill_w = (CONTENT_W * fraction).max(12.0);
+    container(
+        container(text(""))
+            .width(fill_w)
+            .height(3)
+            .style(move |_| container::Style {
+                background: Some(p.accent.into()),
+                border: Border {
+                    radius: 2.0.into(),
+                    width: 0.0,
+                    color: p.accent,
+                },
+                ..Default::default()
+            }),
+    )
+    .width(Length::Fill)
+    .height(3)
+    .style(move |_| container::Style {
+        background: Some(p.surface0.into()),
+        border: Border {
+            radius: 2.0.into(),
+            width: 0.0,
+            color: p.surface0,
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Round radio indicator drawn with pure geometry (no font glyph roulette).
+fn radio_dot(p: theme::Palette, selected: bool) -> Element<'static, Message> {
+    let inner = container(text(""))
+        .width(5)
+        .height(5)
+        .style(move |_| container::Style {
+            background: Some(if selected { p.base } else { p.mantle }.into()),
+            ..Default::default()
+        });
+    container(inner)
+        .width(14)
+        .height(14)
+        .center_x(14)
+        .center_y(14)
+        .style(move |_| container::Style {
+            background: Some(if selected { p.accent } else { p.mantle }.into()),
+            border: Border {
+                radius: 7.0.into(),
+                width: if selected { 0.0 } else { 1.0 },
+                color: p.surface2,
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Option texts: label + optional description. The label turns accent-colored
+/// once the option is selected.
+fn option_texts<'a>(
     p: theme::Palette,
-    status: button::Status,
+    label: &'a str,
+    description: Option<&'a String>,
+    selected: bool,
+) -> Element<'a, Message> {
+    let mut col = column![].spacing(2);
+    col =
+        col.push(
+            text(label.to_string())
+                .size(15)
+                .color(if selected { p.accent } else { p.text }),
+        );
+    if let Some(desc) = description {
+        col = col.push(text(desc.clone()).size(12).color(p.overlay1));
+    }
+    col.into()
+}
+
+/// Row background: the keyboard cursor (and hover) get a subtle mantle plate;
+/// uninteresting rows stay flat on the base color.
+fn row_style(p: theme::Palette, hovered: bool, cursor: bool) -> (Option<iced::Background>, Border) {
+    let bg = if hovered || cursor {
+        Some(p.mantle.into())
+    } else {
+        None
+    };
+    (
+        bg,
+        Border {
+            radius: 8.0.into(),
+            width: 0.0,
+            color: p.mantle,
+        },
+    )
+}
+
+fn single_row(
+    p: theme::Palette,
+    i: usize,
+    opt: &crate::spec::PromptOption,
     selected: bool,
     cursor: bool,
-) -> button::Style {
-    let highlight = selected || cursor;
-    let (background, border_color, border_width) = match (highlight, status) {
-        (true, _) => (p.surface1, p.accent, 1.0),
-        (false, button::Status::Hovered | button::Status::Pressed) => (p.surface1, p.accent, 1.0),
-        (false, _) => (p.surface0, p.surface2, 1.0),
+) -> Element<'_, Message> {
+    button(
+        container(
+            row![
+                radio_dot(p, selected),
+                option_texts(p, &opt.label, opt.description.as_ref(), selected)
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+        )
+        .padding([9, 10])
+        .width(Length::Fill),
+    )
+    .on_press(Message::Select(i))
+    .width(Length::Fill)
+    .style(move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let (background, border) = row_style(p, hovered, cursor);
+        button::Style {
+            background,
+            text_color: p.text,
+            border,
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+fn multi_row(
+    p: theme::Palette,
+    i: usize,
+    opt: &crate::spec::PromptOption,
+    selected: bool,
+    cursor: bool,
+) -> Element<'_, Message> {
+    // The whole row is one button (clicking the label must toggle too); the
+    // checkbox is display-only, the button press flips the state.
+    let cb = checkbox("", selected)
+        .size(16)
+        .style(move |_theme, _status| checkbox::Style {
+            background: if selected {
+                p.accent.into()
+            } else {
+                p.mantle.into()
+            },
+            icon_color: p.base,
+            border: Border {
+                radius: 5.0.into(),
+                width: if selected { 0.0 } else { 1.0 },
+                color: p.surface2,
+            },
+            text_color: Some(p.text),
+        });
+    button(
+        container(
+            row![
+                cb,
+                option_texts(p, &opt.label, opt.description.as_ref(), selected)
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+        )
+        .padding([9, 10])
+        .width(Length::Fill),
+    )
+    .on_press(Message::Toggle(i, !selected))
+    .width(Length::Fill)
+    .style(move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let (background, border) = row_style(p, hovered, cursor);
+        button::Style {
+            background,
+            text_color: p.text,
+            border,
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+fn preview_panel(p: theme::Palette, preview: String) -> Element<'static, Message> {
+    column![
+        text("PREVIEW").size(10).color(p.accent),
+        container(scrollable(text(preview).size(12).color(p.subtext0)).height(Length::Fill))
+            .width(Length::Fill)
+            .height(130)
+            .padding([10, 12])
+            .style(move |_| container::Style {
+                background: Some(p.mantle.into()),
+                border: Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: p.surface0,
+                },
+                ..Default::default()
+            }),
+    ]
+    .spacing(6)
+    .width(Length::Fill)
+    .into()
+}
+
+/// Back + Next/Submit: identical geometry, both Length::Fill — same height,
+/// same width, one shared padding value.
+fn nav_bar(p: theme::Palette, can_go_back: bool, last: bool) -> Element<'static, Message> {
+    let nav_label = if last { "Submit" } else { "Next" };
+    row![
+        button(
+            container(text("Back").size(13).color(p.subtext0))
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .padding([9, 0]),
+        )
+        .on_press_maybe(can_go_back.then_some(Message::Back))
+        .width(Length::Fill)
+        .style(move |_theme, status| ghost_style(p, status)),
+        button(
+            container(text(nav_label.to_string()).size(13).color(p.crust))
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .padding([9, 0]),
+        )
+        .on_press(Message::Next)
+        .width(Length::Fill)
+        .style(move |_theme, status| primary_style(p, status)),
+    ]
+    .spacing(8)
+    .width(Length::Fill)
+    .align_y(Vertical::Center)
+    .into()
+}
+
+// ------------------------------------------------------------------- styles
+
+fn ghost_style(p: theme::Palette, status: button::Status) -> button::Style {
+    let (background, border_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (Some(p.surface0.into()), p.accent),
+        _ => (None, p.surface1),
     };
     button::Style {
-        background: Some(background.into()),
-        text_color: p.text,
+        background,
+        text_color: p.subtext0,
         border: Border {
             radius: 8.0.into(),
-            width: border_width,
+            width: 1.0,
             color: border_color,
         },
         ..Default::default()
     }
 }
 
-fn confirm_style(p: theme::Palette, status: button::Status) -> button::Style {
+fn primary_style(p: theme::Palette, status: button::Status) -> button::Style {
     let background = match status {
         button::Status::Hovered | button::Status::Pressed => p.subtext0,
         _ => p.accent,
@@ -474,7 +641,7 @@ fn text_input_style(p: theme::Palette, status: text_input::Status) -> text_input
     let border_color = if matches!(status, text_input::Status::Focused) {
         p.accent
     } else {
-        p.surface2
+        p.surface1
     };
     text_input::Style {
         background: p.mantle.into(),
@@ -489,6 +656,8 @@ fn text_input_style(p: theme::Palette, status: text_input::Status) -> text_input
         selection: p.accent,
     }
 }
+
+// ------------------------------------------------------- events & window
 
 fn subscription(popup: &Popup) -> Subscription<Message> {
     let mut subs = vec![
@@ -526,16 +695,20 @@ fn window_settings(spec: &PopupSpec) -> window::Settings {
         .questions
         .iter()
         .any(|q| q.options.iter().any(|o| o.preview.is_some()));
-    let mut height = 240.0 + 66.0 * max_options;
+    // header+question 88, rows ~52 each, input 40, nav 38, paddings 36,
+    // progress bar (multi) 16, preview panel 148, countdown 16
+    let mut height = 188.0 + 52.0 * max_options;
     if spec.questions.len() > 1 {
-        height += 40.0; // question tabs
+        height += 16.0;
     }
     if has_preview {
-        height += 160.0; // preview panel
+        height += 148.0;
     }
-    height += 60.0; // Back/Next row
     window::Settings {
-        size: Size::new(460.0, height.clamp(320.0, 900.0)),
+        size: Size::new(WIN_W, height.clamp(300.0, 820.0)),
+        // false on purpose: tiling compositors treat resizable windows as
+        // tileable and blow the popup up to a full frame; non-resizable ones
+        // stay floating. The height estimate above is generous instead.
         resizable: false,
         decorations: false,
         level: window::Level::AlwaysOnTop,
