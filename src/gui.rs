@@ -12,7 +12,7 @@
 use crate::spec::{Answer, AnswerStatus, PopupSpec, Question, QuestionAnswer};
 use crate::theme;
 use iced::alignment::Vertical;
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Id};
 use iced::{keyboard, time, window, Border, Element, Length, Size, Subscription, Task, Theme};
 use std::io::Write;
 use std::time::Duration;
@@ -57,16 +57,24 @@ fn try_run_popup() -> Result<(), String> {
     }
 
     let settings = window_settings(&spec);
-    let input_id = text_input::Id::unique();
-    iced::application("aski", update, view)
-        .subscription(subscription)
-        .theme(|_| Theme::Dark)
-        .window(settings)
-        .run_with(move || {
-            let task = text_input::focus(input_id.clone());
-            (Popup::new(spec, input_id), task)
-        })
-        .map_err(|e| format!("failed to run GUI: {e}"))
+    let input_id = Id::unique();
+    // BootFn needs `Fn`, so the closure clones its captures per call.
+    let boot_spec = spec.clone();
+    let boot_id = input_id.clone();
+    iced::application(
+        move || {
+            let task = iced::widget::operation::focus(boot_id.clone()).into();
+            (Popup::new(boot_spec.clone(), boot_id.clone()), task)
+        },
+        update,
+        view,
+    )
+    .subscription(subscription)
+    .theme(|_popup: &Popup| Theme::Dark)
+    .window(settings)
+    .title("aski")
+    .run()
+    .map_err(|e| format!("failed to run GUI: {e}"))
 }
 
 /// Per-question answer state.
@@ -84,12 +92,12 @@ struct Popup {
     /// Keyboard-focused option within the current question. Cleared on mouse
     /// clicks — the plate highlight is a keyboard aid, not a selection state.
     cursor: Option<usize>,
-    input_id: text_input::Id,
+    input_id: Id,
     remaining: Option<u64>,
 }
 
 impl Popup {
-    fn new(spec: PopupSpec, input_id: text_input::Id) -> Self {
+    fn new(spec: PopupSpec, input_id: Id) -> Self {
         let flavor = spec.flavor.unwrap_or_default();
         let palette = theme::resolve(flavor, spec.accent.as_deref());
         let remaining = match spec.timeout_secs {
@@ -506,7 +514,8 @@ fn multi_row(
 ) -> Element<'_, Message> {
     // The whole row is one button (clicking the label must toggle too); the
     // checkbox is display-only, the button press flips the state.
-    let cb = checkbox("", selected)
+    let cb = checkbox(selected)
+        .label("")
         .size(16)
         .style(move |_theme, _status| checkbox::Style {
             background: if selected {
@@ -638,7 +647,7 @@ fn primary_style(p: theme::Palette, status: button::Status) -> button::Style {
 }
 
 fn text_input_style(p: theme::Palette, status: text_input::Status) -> text_input::Style {
-    let border_color = if matches!(status, text_input::Status::Focused) {
+    let border_color = if matches!(status, text_input::Status::Focused { .. }) {
         p.accent
     } else {
         p.surface1
@@ -662,7 +671,10 @@ fn text_input_style(p: theme::Palette, status: text_input::Status) -> text_input
 fn subscription(popup: &Popup) -> Subscription<Message> {
     let mut subs = vec![
         window::close_requests().map(|_| Message::Close),
-        keyboard::on_key_press(|key, _modifiers| key_to_message(key)),
+        iced::event::listen_with(|event, _status, _id| match event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => key_to_message(key),
+            _ => None,
+        }),
     ];
     if popup.remaining.is_some() {
         subs.push(time::every(Duration::from_secs(1)).map(|_| Message::Tick));

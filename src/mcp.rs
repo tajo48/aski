@@ -8,14 +8,10 @@ use crate::spec::{
     Answer, AnswerStatus, Flavor, PopupSpec, PromptOption, Question, QuestionAnswer,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Parameters;
-use rmcp::handler::server::wrapper::Json;
-use rmcp::model::{
-    ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
-};
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::{ErrorData as McpError, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
-use std::future::Future;
 use std::time::Duration;
 
 use rmcp::schemars;
@@ -151,18 +147,16 @@ If the user cancels or the popup times out, pick the safest option yourself and 
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AskServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
+    fn get_info(&self) -> ServerConfig {
+        // rmcp >= 0.6: ServerInfo is a deprecated alias built via constructors —
+        // the protocol version is stamped by the runtime, not by us.
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(
                 "Interactive human-in-the-loop questions as GUI popups. Call `ask_user` when a \
                  decision belongs to the user; group related decisions (up to 4) into one call; \
-                 the popup lives only for the duration of the questions."
-                    .into(),
-            ),
-        }
+                 the popup lives only for the duration of the questions.",
+            )
     }
 }
 
