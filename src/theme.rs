@@ -115,17 +115,17 @@ const ACCENTS: &[(&str, u32, u32)] = &[
 
 fn accent_rgb(flavor: Flavor, name: Option<&str>) -> u32 {
     let latte = flavor == Flavor::Latte;
-    let wanted = name.unwrap_or("mauve");
+    let wanted = name.unwrap_or("blue");
     for (n, dark, light) in ACCENTS {
         if n.eq_ignore_ascii_case(wanted) {
             return if latte { *light } else { *dark };
         }
     }
-    // Unknown accent name: fall back to mauve.
+    // Unknown accent name: fall back to blue.
     if latte {
-        0x8839ef
+        0x1e66f5
     } else {
-        0xcba6f7
+        0x89b4fa
     }
 }
 
