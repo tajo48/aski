@@ -185,6 +185,7 @@ enum Message {
     Next,
     Back,
     Edit(text_editor::Action),
+    ApplyResize(f32),
     Tick,
     Close,
 }
@@ -234,7 +235,7 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
                 popup.current -= 1;
                 popup.cursor = None;
             }
-            Task::none()
+            resize_to_current(popup)
         }
         Message::Next => {
             let last = popup.current + 1 == popup.spec.questions.len();
@@ -253,11 +254,14 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             }
             popup.current += 1;
             popup.cursor = None;
-            Task::none()
+            resize_to_current(popup)
         }
         Message::Edit(action) => {
             popup.state_mut().note.perform(action);
             Task::none()
+        }
+        Message::ApplyResize(height) => {
+            window::latest().and_then(move |id| window::resize(id, Size::new(WIN_W, height)))
         }
         Message::Tick => match popup.remaining {
             Some(0) => finish(Answer {
@@ -458,14 +462,11 @@ fn option_texts<'a>(
     col.into()
 }
 
-/// Row background: the keyboard cursor (and hover) get a subtle mantle plate;
-/// uninteresting rows stay flat on the base color.
-fn row_style(p: theme::Palette, hovered: bool, cursor: bool) -> (Option<iced::Background>, Border) {
-    let bg = if hovered || cursor {
-        Some(p.mantle.into())
-    } else {
-        None
-    };
+/// Row background: only the cursor (click/keyboard focus) gets a plate.
+/// Hover intentionally does NOT highlight — in multi-select it read as a
+/// phantom selection on rows the user never touched.
+fn row_style(p: theme::Palette, cursor: bool) -> (Option<iced::Background>, Border) {
+    let bg = cursor.then(|| p.mantle.into());
     (
         bg,
         Border {
@@ -497,9 +498,8 @@ fn single_row(
     )
     .on_press(Message::Select(i))
     .width(Length::Fill)
-    .style(move |_theme, status| {
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let (background, border) = row_style(p, hovered, cursor);
+    .style(move |_theme, _status| {
+        let (background, border) = row_style(p, cursor);
         button::Style {
             background,
             text_color: p.text,
@@ -550,9 +550,8 @@ fn multi_row(
     )
     .on_press(Message::Toggle(i, !selected))
     .width(Length::Fill)
-    .style(move |_theme, status| {
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let (background, border) = row_style(p, hovered, cursor);
+    .style(move |_theme, _status| {
+        let (background, border) = row_style(p, cursor);
         button::Style {
             background,
             text_color: p.text,
@@ -735,62 +734,80 @@ fn key_to_message(
 }
 
 /// Estimated rendered height of a text block at the given font size: visual
-/// lines from char counts (avg glyph ~0.55em on the 360px content box) ×
-/// ~1.3 line height. Heuristic on purpose — deterministic, computed once at
-/// startup, no runtime window resizing (that proved unreliable).
+/// lines from char counts (avg glyph ~0.60em on the 360px content box) ×
+/// ~1.45 line height. Coefficients measured against actual iced 0.14 renders
+/// — underestimating clips the nav row, overestimating just adds air.
 fn text_height(text: &str, size: f32) -> f32 {
-    let chars_per_line = (CONTENT_W / (0.55 * size)).max(10.0);
+    let chars_per_line = (CONTENT_W / (0.60 * size)).max(10.0);
     let lines: usize = text
         .lines()
         .map(|l| ((l.chars().count() as f32 / chars_per_line).ceil().max(1.0)) as usize)
         .sum();
-    lines as f32 * size * 1.3
+    lines as f32 * size * 1.45
+}
+
+/// Estimated height of the popup while showing question `idx`: content-aware
+/// wrap estimates per element (the editor is a fixed-height textarea, so the
+/// result is deterministic from the spec alone).
+fn question_height(spec: &PopupSpec, idx: usize) -> f32 {
+    let q = &spec.questions[idx];
+    let mut h = 36.0 // vertical padding
+        + 14.0 + 14.0 // topic label + spacing
+        + text_height(&q.question, 16.0)
+        + 14.0
+        + EDITOR_H
+        + 14.0 // note editor + spacing
+        + 36.0
+        + 14.0 // nav + spacing
+        + 26.0; // countdown + its spacing
+    for opt in &q.options {
+        h += 30.0 // row padding (9+9) + per-row safety
+            + text_height(&opt.label, 15.0)
+            + opt
+                .description
+                .as_ref()
+                .map(|d| text_height(d, 12.0))
+                .unwrap_or(0.0)
+            + 4.0; // row spacing
+    }
+    h += 14.0; // spacing before the options block
+    h += 36.0; // global safety margin — small overestimate is just air,
+               // underestimate clips the bottom of the window
+    if spec.questions.len() > 1 {
+        h += 20.0; // progress bar
+    }
+    if q.options.iter().any(|o| o.preview.is_some()) {
+        h += 84.0; // preview slot (tip or code panel, fixed height)
+    }
+    h.clamp(300.0, 900.0)
+}
+
+/// One discrete resize when switching questions — the only runtime resize in
+/// the popup's life (never during typing, which the compositor dropped).
+/// The compositor race-y-drops single resize requests (same question, two
+/// visits, two different window sizes), so the same target size is hammered
+/// three times: immediately, +150ms and +400ms. Identical sizes = no cost.
+fn resize_to_current(popup: &Popup) -> Task<Message> {
+    let height = question_height(&popup.spec, popup.current);
+    Task::batch([0u64, 150, 400].map(|ms| {
+        Task::perform(
+            async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                height
+            },
+            Message::ApplyResize,
+        )
+    }))
 }
 
 fn window_settings(spec: &PopupSpec) -> window::Settings {
-    // The window is fully static (runtime resizing proved unreliable: dropped
-    // resizes, stale frames), so it is sized for the TALLEST question with
-    // content-aware wrapping estimates: long labels/descriptions wrap into
-    // multiple lines and the flat per-row guess used to clip the nav row.
-    // Editor is pre-reserved at 6 lines (162px); past that it scrolls.
-    let mut height = 0.0f32;
-    for q in &spec.questions {
-        let mut h = 36.0 // vertical padding
-            + 14.0 + 14.0 // topic label + spacing
-            + text_height(&q.question, 16.0)
-            + 14.0
-            + EDITOR_H
-            + 14.0 // note editor (6 lines) + spacing
-            + 36.0
-            + 14.0 // nav + spacing
-            + 26.0; // countdown + its spacing
-        for opt in &q.options {
-            h += 20.0 // row padding
-                + text_height(&opt.label, 15.0)
-                + opt
-                    .description
-                    .as_ref()
-                    .map(|d| text_height(d, 12.0))
-                    .unwrap_or(0.0)
-                + 2.0; // row spacing
-        }
-        h += 14.0; // spacing before the options block
-        height = height.max(h);
-    }
-    if spec.questions.len() > 1 {
-        height += 20.0; // progress bar
-    }
-    let has_preview = spec
-        .questions
-        .iter()
-        .any(|q| q.options.iter().any(|o| o.preview.is_some()));
-    // Preview slot ~70 + its spacing (always present when any option has a
-    // preview: tip or code panel, fixed height).
-    if has_preview {
-        height += 84.0;
-    }
+    // Initial size = the TALLEST question (nav switches between per-question
+    // sizes with a single discrete resize each).
+    let height = (0..spec.questions.len())
+        .map(|i| question_height(spec, i))
+        .fold(0.0f32, f32::max);
     window::Settings {
-        size: Size::new(WIN_W, height.clamp(300.0, 900.0)),
+        size: Size::new(WIN_W, height),
         // false on purpose: tiling compositors treat resizable windows as
         // tileable and blow the popup up to a full frame; non-resizable ones
         // stay floating. The content-aware estimate above is generous instead.
