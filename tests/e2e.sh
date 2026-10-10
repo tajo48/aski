@@ -125,8 +125,8 @@ t14_long_note() {
     say "T14: long multiline note"
     hint "pick Rust, then paste/type this 4-line note (Enter = new lines):"
     hint "  line one with Polish chars: abcdefg"
-    hint "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    hint "  line after a long unbroken token"
+    hint "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    hint "  line after a short unbroken token"
     hint "  END-OF-NOTE"
     hint "then press Shift+Enter to send"
     popup_test "T14 long note appended after selection" '"selections":["Rust","line one' \

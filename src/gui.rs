@@ -1,8 +1,9 @@
 //! The GUI popup: one process per tool call, one question on screen at a time,
 //! borderless always-on-top window, lives exactly as long as the questions do.
 //!
-//! Keyboard: ↑/↓ move the option cursor, Enter commits the current question
-//! (custom text > highlighted option > ticked options) and advances, Esc cancels.
+//! Keyboard: ↑/↓ move the option cursor, Enter selects the highlighted
+//! option (stays on the question), Shift+Enter sends the whole answer —
+//! from any question. Esc cancels.
 //!
 //! Visual concept: a quiet full-bleed menu list, not a web form — a thin
 //! progress bar for multi-question runs, an uppercase topic label over the
@@ -85,7 +86,12 @@ struct Popup {
     current: usize,
     /// Keyboard-focused option within the current question. Cleared on mouse
     /// clicks — the plate highlight is a keyboard aid, not a selection state.
+    /// Keyboard-focused option within the current question. Cleared on mouse
+    /// clicks — the plate highlight is a keyboard aid, not a selection state.
     cursor: Option<usize>,
+    /// Whether the cursor came from the keyboard (arrows/Enter) — the plate
+    /// renders only then; clicks update the cursor for previews silently.
+    plate: bool,
     remaining: Option<u64>,
 }
 
@@ -111,6 +117,7 @@ impl Popup {
             states,
             current: 0,
             cursor: None,
+            plate: false,
             remaining,
         }
     }
@@ -148,8 +155,8 @@ impl Popup {
     fn collect(&self, idx: usize) -> Vec<String> {
         let st = &self.states[idx];
         let q = &self.spec.questions[idx];
-        let text = st.note.text();
-        let custom = text.trim();
+        let note_text = st.note.text();
+        let custom = note_text.trim();
         let mut out: Vec<String> = st
             .selected
             .iter()
@@ -183,9 +190,10 @@ enum Message {
     Toggle(usize, bool),
     MoveCursor(i32),
     Next,
+    SelectCursor,
+    SubmitAll,
     Back,
     Edit(text_editor::Action),
-    ApplyResize(f32),
     Tick,
     Close,
 }
@@ -214,6 +222,7 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
                     *slot = j == i;
                 }
                 popup.cursor = Some(i);
+                popup.plate = false;
             }
             Task::none()
         }
@@ -221,21 +230,50 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             if let Some(slot) = popup.state_mut().selected.get_mut(i) {
                 *slot = value;
             }
-            popup.cursor = Some(i);
+            // Clicks move the preview cursor silently — no plate.
+            popup.cursor = if value { Some(i) } else { None };
+            popup.plate = false;
             Task::none()
         }
         Message::MoveCursor(delta) => {
             let max = popup.question().options.len().saturating_sub(1);
             let base = popup.cursor.map_or(0, |c| c as i32);
             popup.cursor = Some((base + delta).clamp(0, max as i32) as usize);
+            popup.plate = true;
             Task::none()
+        }
+        Message::SelectCursor => {
+            // Enter: apply click semantics to the highlighted option —
+            // single-select marks it, multi-select toggles the tick.
+            if let Some(i) = popup.cursor {
+                if popup.question().multi_select {
+                    let ticked = popup.state().selected.get(i).copied().unwrap_or(false);
+                    return update(popup, Message::Toggle(i, !ticked));
+                }
+                return update(popup, Message::Select(i));
+            }
+            Task::none()
+        }
+        Message::SubmitAll => {
+            // Shift+Enter: send everything collected so far, from any page.
+            let answers = (0..popup.spec.questions.len())
+                .map(|i| QuestionAnswer {
+                    header: popup.spec.questions[i].header.clone(),
+                    selections: popup.collect(i),
+                })
+                .collect();
+            finish(Answer {
+                status: AnswerStatus::Answered,
+                answers,
+                error: None,
+            });
         }
         Message::Back => {
             if popup.current > 0 {
                 popup.current -= 1;
                 popup.cursor = None;
             }
-            resize_to_current(popup)
+            Task::none()
         }
         Message::Next => {
             let last = popup.current + 1 == popup.spec.questions.len();
@@ -254,14 +292,11 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             }
             popup.current += 1;
             popup.cursor = None;
-            resize_to_current(popup)
+            Task::none()
         }
         Message::Edit(action) => {
             popup.state_mut().note.perform(action);
             Task::none()
-        }
-        Message::ApplyResize(height) => {
-            window::latest().and_then(move |id| window::resize(id, Size::new(WIN_W, height)))
         }
         Message::Tick => match popup.remaining {
             Some(0) => finish(Answer {
@@ -321,7 +356,9 @@ fn view(popup: &Popup) -> Element<'_, Message> {
     let mut options = column![].spacing(2).width(Length::Fill);
     for (i, opt) in q.options.iter().enumerate() {
         let is_selected = st.selected[i];
-        let is_cursor = popup.cursor == Some(i);
+        // The plate is a keyboard-only aid: clicks move the preview cursor
+        // silently, arrows light it up.
+        let is_cursor = popup.plate && popup.cursor == Some(i);
         if q.multi_select {
             options = options.push(multi_row(p, i, opt, is_selected, is_cursor));
         } else {
@@ -374,7 +411,7 @@ fn view(popup: &Popup) -> Element<'_, Message> {
 
     container(col)
         .width(Length::Fill)
-        .height(Length::Fill)
+        .center_y(Length::Fill)
         .padding([18, PAD_X as u16])
         .style(move |_theme| container::Style {
             background: Some(p.base.into()),
@@ -738,12 +775,12 @@ fn key_to_message(
 /// ~1.45 line height. Coefficients measured against actual iced 0.14 renders
 /// — underestimating clips the nav row, overestimating just adds air.
 fn text_height(text: &str, size: f32) -> f32 {
-    let chars_per_line = (CONTENT_W / (0.60 * size)).max(10.0);
+    let chars_per_line = (CONTENT_W / (0.58 * size)).max(10.0);
     let lines: usize = text
         .lines()
         .map(|l| ((l.chars().count() as f32 / chars_per_line).ceil().max(1.0)) as usize)
         .sum();
-    lines as f32 * size * 1.45
+    lines as f32 * size * 1.4
 }
 
 /// Estimated height of the popup while showing question `idx`: content-aware
@@ -761,18 +798,18 @@ fn question_height(spec: &PopupSpec, idx: usize) -> f32 {
         + 14.0 // nav + spacing
         + 26.0; // countdown + its spacing
     for opt in &q.options {
-        h += 30.0 // row padding (9+9) + per-row safety
+        h += 26.0 // row padding (9+9) + per-row safety
             + text_height(&opt.label, 15.0)
             + opt
                 .description
                 .as_ref()
                 .map(|d| text_height(d, 12.0))
                 .unwrap_or(0.0)
-            + 4.0; // row spacing
+            + 2.0; // row spacing
     }
     h += 14.0; // spacing before the options block
-    h += 36.0; // global safety margin — small overestimate is just air,
-               // underestimate clips the bottom of the window
+    h += 8.0; // global safety margin — small overestimate is just air,
+              // underestimate clips the bottom of the window
     if spec.questions.len() > 1 {
         h += 20.0; // progress bar
     }
@@ -780,24 +817,6 @@ fn question_height(spec: &PopupSpec, idx: usize) -> f32 {
         h += 84.0; // preview slot (tip or code panel, fixed height)
     }
     h.clamp(300.0, 900.0)
-}
-
-/// One discrete resize when switching questions — the only runtime resize in
-/// the popup's life (never during typing, which the compositor dropped).
-/// The compositor race-y-drops single resize requests (same question, two
-/// visits, two different window sizes), so the same target size is hammered
-/// three times: immediately, +150ms and +400ms. Identical sizes = no cost.
-fn resize_to_current(popup: &Popup) -> Task<Message> {
-    let height = question_height(&popup.spec, popup.current);
-    Task::batch([0u64, 150, 400].map(|ms| {
-        Task::perform(
-            async move {
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                height
-            },
-            Message::ApplyResize,
-        )
-    }))
 }
 
 fn window_settings(spec: &PopupSpec) -> window::Settings {
