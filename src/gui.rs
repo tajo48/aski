@@ -206,12 +206,13 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
     match message {
         Message::Select(i) => {
             // Single-select: clicking marks the option; Next/Enter commits.
-            // The cursor highlight is keyboard-only, so clear it here.
+            // The cursor follows the click so the preview panel tracks what
+            // the user is looking at — same for the keyboard.
             if popup.question().options.get(i).is_some() {
                 for (j, slot) in popup.state_mut().selected.iter_mut().enumerate() {
                     *slot = j == i;
                 }
-                popup.cursor = None;
+                popup.cursor = Some(i);
             }
             Task::none()
         }
@@ -219,7 +220,7 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             if let Some(slot) = popup.state_mut().selected.get_mut(i) {
                 *slot = value;
             }
-            popup.cursor = None;
+            popup.cursor = Some(i);
             Task::none()
         }
         Message::MoveCursor(delta) => {
@@ -287,23 +288,11 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
 /// + border 2, + 24px slack so a fresh caret line never triggers the
 /// editor's internal scroll (its offset sticks and text renders over the
 /// border).
-fn editor_height(popup: &Popup) -> f32 {
-    const CHARS_PER_LINE: f32 = 45.0; // ~360px box at font size 13
-    const LINE_H: f32 = 20.0;
-    const CHROME: f32 = 42.0; // padding 16 + border 2 + caret-scroll slack 24
-    let visual: usize = popup
-        .state()
-        .note
-        .text()
-        .lines()
-        .map(|line| {
-            (line.chars().count() as f32 / CHARS_PER_LINE)
-                .ceil()
-                .max(1.0) as usize
-        })
-        .sum();
-    visual.max(1).min(6) as f32 * LINE_H + CHROME
-}
+/// Note editor: a full-size, fixed-height textarea (6 visible lines) — the
+/// empty bottom part of the field is normal textarea space, not layout
+/// leftover; past 6 lines it scrolls internally (the box never resizes, so
+/// the internal scroll offset stays stable).
+const EDITOR_H: f32 = 162.0;
 
 fn view(popup: &Popup) -> Element<'_, Message> {
     let p = popup.palette;
@@ -341,22 +330,14 @@ fn view(popup: &Popup) -> Element<'_, Message> {
             .height(Length::Shrink),
     );
 
-    if let Some(preview) = popup
-        .cursor
-        .and_then(|c| q.options.get(c))
-        .and_then(|o| o.preview.clone())
-    {
-        col = col.push(preview_panel(p, preview));
-    } else if q.options.iter().any(|o| o.preview.is_some()) {
-        // Previews are keyboard-driven (↑/↓ move the cursor; clicks clear it),
-        // which is invisible to mouse users — advertise it while no option is
-        // highlighted. Eats into the preview allowance of the window estimate,
-        // so it never adds height.
-        col = col.push(
-            text("tip: press the up/down arrows to preview options")
-                .size(11)
-                .color(p.overlay0),
-        );
+    // Preview slot: always present when the question has previews — shows
+    // either the code panel or the ↑/↓ tip, never changes size.
+    if q.options.iter().any(|o| o.preview.is_some()) {
+        let preview = popup
+            .cursor
+            .and_then(|c| q.options.get(c))
+            .and_then(|o| o.preview.clone());
+        col = col.push(preview_slot(p, preview));
     }
 
     // Multiline note editor: Enter inserts a newline (the editor consumes
@@ -368,7 +349,7 @@ fn view(popup: &Popup) -> Element<'_, Message> {
             .size(13)
             .padding([8, 12])
             .width(CONTENT_W)
-            .height(editor_height(popup))
+            .height(EDITOR_H)
             .style(move |_theme, status| editor_style(p, status))
             .on_action(Message::Edit),
     );
@@ -582,26 +563,46 @@ fn multi_row(
     .into()
 }
 
-fn preview_panel(p: theme::Palette, preview: String) -> Element<'static, Message> {
-    column![
-        text("PREVIEW").size(10).color(p.accent),
-        container(scrollable(text(preview).size(12).color(p.subtext0)).height(Length::Fill))
-            .width(Length::Fill)
-            .height(130)
-            .padding([10, 12])
-            .style(move |_| container::Style {
-                background: Some(p.mantle.into()),
-                border: Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: p.surface0,
-                },
-                ..Default::default()
-            }),
-    ]
-    .spacing(6)
-    .width(Length::Fill)
-    .into()
+/// Fixed-height preview slot, styled identically to the note editor's box
+/// (mantle background, 8px radius, surface0 border) so it reads as part of
+/// the form: shows the scrollable code preview for the cursor option, or the
+/// centered ↑/↓ tip as a placeholder. Never changes size — the window is
+/// static, so preview on/off must not shift the layout.
+fn preview_slot(p: theme::Palette, preview: Option<String>) -> Element<'static, Message> {
+    const SLOT_H: f32 = 70.0;
+    let inner: Element<'static, Message> = match preview {
+        Some(code) => column![
+            text("PREVIEW").size(10).color(p.accent),
+            scrollable(text(code).size(12).color(p.subtext0)).height(Length::Fill),
+        ]
+        .spacing(4)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into(),
+        None => container(
+            text("tip: press the up/down arrows to preview options")
+                .size(11)
+                .color(p.overlay0),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(Vertical::Center)
+        .into(),
+    };
+    container(inner)
+        .width(Length::Fill)
+        .height(SLOT_H)
+        .padding([8, 12])
+        .style(move |_| container::Style {
+            background: Some(p.mantle.into()),
+            border: Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: p.surface0,
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Next/Submit, plus Back only when there is something to go back to.
@@ -758,7 +759,7 @@ fn window_settings(spec: &PopupSpec) -> window::Settings {
             + 14.0 + 14.0 // topic label + spacing
             + text_height(&q.question, 16.0)
             + 14.0
-            + 162.0
+            + EDITOR_H
             + 14.0 // note editor (6 lines) + spacing
             + 36.0
             + 14.0 // nav + spacing
@@ -783,8 +784,10 @@ fn window_settings(spec: &PopupSpec) -> window::Settings {
         .questions
         .iter()
         .any(|q| q.options.iter().any(|o| o.preview.is_some()));
+    // Preview slot ~70 + its spacing (always present when any option has a
+    // preview: tip or code panel, fixed height).
     if has_preview {
-        height += 152.0; // preview panel
+        height += 84.0;
     }
     window::Settings {
         size: Size::new(WIN_W, height.clamp(300.0, 900.0)),
