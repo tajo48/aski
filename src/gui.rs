@@ -751,8 +751,9 @@ fn subscription(popup: &Popup) -> Subscription<Message> {
 // Character keys are never handled here — they must reach the note editor.
 // `status` tells us whether a widget (the focused editor) already consumed
 // the key: if it did, we stay out of the way (Enter = newline, arrows = caret).
-// While typing, Shift+Enter is the explicit "send" — it fires regardless of
-// focus, so the stray newline the editor inserts is discarded with the process.
+// Enter selects the highlighted option; Shift+Enter sends from any page
+// (fires regardless of focus — the stray newline the editor inserts goes
+// away with the process).
 fn key_to_message(
     key: keyboard::Key,
     modifiers: keyboard::Modifiers,
@@ -762,8 +763,8 @@ fn key_to_message(
     let ignored = matches!(status, iced::event::Status::Ignored);
     match key {
         keyboard::Key::Named(Named::Escape) => Some(Message::Close),
-        keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::Next),
-        keyboard::Key::Named(Named::Enter) if ignored => Some(Message::Next),
+        keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::SubmitAll),
+        keyboard::Key::Named(Named::Enter) if ignored => Some(Message::SelectCursor),
         keyboard::Key::Named(Named::ArrowUp) if ignored => Some(Message::MoveCursor(-1)),
         keyboard::Key::Named(Named::ArrowDown) if ignored => Some(Message::MoveCursor(1)),
         _ => None,

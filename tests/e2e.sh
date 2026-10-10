@@ -74,7 +74,7 @@ t1_single_select() {
 
 t2_keyboard() {
     say "T2: keyboard navigation"
-    hint "press ArrowDown twice (lands on SQLite), then Enter"
+    hint "press ArrowDown twice, then Enter (selects SQLite), then Shift+Enter to send"
     popup_test "T2 arrow keys + Enter" '"selections":["SQLite"]' \
         '{"questions":[{"question":"Press Down twice, then Enter.","header":"T2","options":[{"label":"PostgreSQL"},{"label":"SQLite"},{"label":"MongoDB"}]}],"timeout_secs":120}'
 }
@@ -95,7 +95,7 @@ t4_other() {
 
 t5_preview() {
     say "T5: preview panel"
-    hint "move Down between options — a code panel must appear for PostgreSQL/SQLite; answer SQLite"
+    hint "move Down between options — a code panel must appear for PostgreSQL/SQLite; answer SQLite (Enter selects), then Shift+Enter to send"
     popup_test "T5 preview panel" '"selections":["SQLite"]' \
         '{"questions":[{"question":"Check the preview panel, then answer SQLite.","header":"T5","options":[{"label":"PostgreSQL","preview":"DATABASE_URL=postgres://localhost/app"},{"label":"SQLite","preview":"Connection::open(\"app.db\")?"},{"label":"MongoDB"}]}],"timeout_secs":120}'
 }
