@@ -73,6 +73,8 @@ fn try_run_popup() -> Result<(), String> {
 /// Per-question answer state.
 struct QuestionState {
     selected: Vec<bool>,
+    /// Free-form note for THIS question; Enter = newline, Shift+Enter sends.
+    note: text_editor::Content,
 }
 
 struct Popup {
@@ -84,8 +86,6 @@ struct Popup {
     /// Keyboard-focused option within the current question. Cleared on mouse
     /// clicks — the plate highlight is a keyboard aid, not a selection state.
     cursor: Option<usize>,
-    /// Multiline free-form note; Enter = newline, Shift+Enter sends.
-    note: text_editor::Content,
     remaining: Option<u64>,
 }
 
@@ -102,6 +102,7 @@ impl Popup {
             .iter()
             .map(|q| QuestionState {
                 selected: vec![false; q.options.len()],
+                note: text_editor::Content::new(),
             })
             .collect();
         Self {
@@ -110,7 +111,6 @@ impl Popup {
             states,
             current: 0,
             cursor: None,
-            note: text_editor::Content::new(),
             remaining,
         }
     }
@@ -141,33 +141,30 @@ impl Popup {
         }
     }
 
-    /// Resolve the final selections for question `idx`: custom text wins, then
-    /// ticked options, then (single-select only) the highlighted option.
+    /// Resolve the final selections for question `idx`: ticked options plus
+    /// this question's free-form note appended at the end (the note never
+    /// replaces a selection); with nothing ticked, the note stands alone;
+    /// single-select only: otherwise the highlighted option.
     fn collect(&self, idx: usize) -> Vec<String> {
         let st = &self.states[idx];
         let q = &self.spec.questions[idx];
-        let text = self.note.text();
+        let text = st.note.text();
         let custom = text.trim();
-        if !custom.is_empty() {
-            return vec![custom.to_string()];
-        }
-        let ticked: Vec<String> = st
+        let mut out: Vec<String> = st
             .selected
             .iter()
             .enumerate()
             .filter(|(_, checked)| **checked)
             .map(|(i, _)| q.options[i].label.clone())
             .collect();
-        if !ticked.is_empty() {
-            // Multi-select: a typed note is returned IN ADDITION to the ticked
-            // options, as its own entry — it never replaces them. (Single-select
-            // has at most one tick, and an explicit custom answer wins.)
+        if !out.is_empty() {
             if !custom.is_empty() {
-                let mut all = ticked;
-                all.push(custom.to_string());
-                return all;
+                out.push(custom.to_string());
             }
-            return ticked;
+            return out;
+        }
+        if !custom.is_empty() {
+            return vec![custom.to_string()];
         }
         if !q.multi_select {
             if let Some(cursor) = self.cursor {
@@ -258,7 +255,7 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Edit(action) => {
-            popup.note.perform(action);
+            popup.state_mut().note.perform(action);
             Task::none()
         }
         Message::Tick => match popup.remaining {
@@ -295,6 +292,7 @@ fn editor_height(popup: &Popup) -> f32 {
     const LINE_H: f32 = 20.0;
     const CHROME: f32 = 42.0; // padding 16 + border 2 + caret-scroll slack 24
     let visual: usize = popup
+        .state()
         .note
         .text()
         .lines()
@@ -349,12 +347,22 @@ fn view(popup: &Popup) -> Element<'_, Message> {
         .and_then(|o| o.preview.clone())
     {
         col = col.push(preview_panel(p, preview));
+    } else if q.options.iter().any(|o| o.preview.is_some()) {
+        // Previews are keyboard-driven (↑/↓ move the cursor; clicks clear it),
+        // which is invisible to mouse users — advertise it while no option is
+        // highlighted. Eats into the preview allowance of the window estimate,
+        // so it never adds height.
+        col = col.push(
+            text("tip: press the up/down arrows to preview options")
+                .size(11)
+                .color(p.overlay0),
+        );
     }
 
     // Multiline note editor: Enter inserts a newline (the editor consumes
     // the key), Shift+Enter sends — intercepted globally in `key_to_message`.
     col = col.push(
-        text_editor(&popup.note)
+        text_editor(&st.note)
             .id(iced::widget::Id::new("aski-note"))
             .placeholder("Other… free-form answer")
             .size(13)
@@ -596,10 +604,23 @@ fn preview_panel(p: theme::Palette, preview: String) -> Element<'static, Message
     .into()
 }
 
-/// Back + Next/Submit: identical geometry, both Length::Fill — same height,
-/// same width, one shared padding value.
+/// Next/Submit, plus Back only when there is something to go back to.
 fn nav_bar(p: theme::Palette, can_go_back: bool, last: bool) -> Element<'static, Message> {
     let nav_label = if last { "Submit" } else { "Next" };
+    let next = button(
+        container(text(nav_label.to_string()).size(13).color(p.crust))
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .padding([9, 0]),
+    )
+    .on_press(Message::Next)
+    .width(Length::Fill)
+    .style(move |_theme, status| primary_style(p, status));
+
+    if !can_go_back {
+        return row![next].width(Length::Fill).into();
+    }
+
     row![
         button(
             container(text("Back").size(13).color(p.subtext0))
@@ -607,18 +628,10 @@ fn nav_bar(p: theme::Palette, can_go_back: bool, last: bool) -> Element<'static,
                 .center_x(Length::Fill)
                 .padding([9, 0]),
         )
-        .on_press_maybe(can_go_back.then_some(Message::Back))
+        .on_press(Message::Back)
         .width(Length::Fill)
         .style(move |_theme, status| ghost_style(p, status)),
-        button(
-            container(text(nav_label.to_string()).size(13).color(p.crust))
-                .width(Length::Fill)
-                .center_x(Length::Fill)
-                .padding([9, 0]),
-        )
-        .on_press(Message::Next)
-        .width(Length::Fill)
-        .style(move |_theme, status| primary_style(p, status)),
+        next,
     ]
     .spacing(8)
     .width(Length::Fill)
@@ -720,35 +733,64 @@ fn key_to_message(
     }
 }
 
+/// Estimated rendered height of a text block at the given font size: visual
+/// lines from char counts (avg glyph ~0.55em on the 360px content box) ×
+/// ~1.3 line height. Heuristic on purpose — deterministic, computed once at
+/// startup, no runtime window resizing (that proved unreliable).
+fn text_height(text: &str, size: f32) -> f32 {
+    let chars_per_line = (CONTENT_W / (0.55 * size)).max(10.0);
+    let lines: usize = text
+        .lines()
+        .map(|l| ((l.chars().count() as f32 / chars_per_line).ceil().max(1.0)) as usize)
+        .sum();
+    lines as f32 * size * 1.3
+}
+
 fn window_settings(spec: &PopupSpec) -> window::Settings {
-    let max_options = spec
-        .questions
-        .iter()
-        .map(|q| q.options.len())
-        .max()
-        .unwrap_or(2) as f32;
+    // The window is fully static (runtime resizing proved unreliable: dropped
+    // resizes, stale frames), so it is sized for the TALLEST question with
+    // content-aware wrapping estimates: long labels/descriptions wrap into
+    // multiple lines and the flat per-row guess used to clip the nav row.
+    // Editor is pre-reserved at 6 lines (162px); past that it scrolls.
+    let mut height = 0.0f32;
+    for q in &spec.questions {
+        let mut h = 36.0 // vertical padding
+            + 14.0 + 14.0 // topic label + spacing
+            + text_height(&q.question, 16.0)
+            + 14.0
+            + 162.0
+            + 14.0 // note editor (6 lines) + spacing
+            + 36.0
+            + 14.0 // nav + spacing
+            + 26.0; // countdown + its spacing
+        for opt in &q.options {
+            h += 20.0 // row padding
+                + text_height(&opt.label, 15.0)
+                + opt
+                    .description
+                    .as_ref()
+                    .map(|d| text_height(d, 12.0))
+                    .unwrap_or(0.0)
+                + 2.0; // row spacing
+        }
+        h += 14.0; // spacing before the options block
+        height = height.max(h);
+    }
+    if spec.questions.len() > 1 {
+        height += 20.0; // progress bar
+    }
     let has_preview = spec
         .questions
         .iter()
         .any(|q| q.options.iter().any(|o| o.preview.is_some()));
-    // Chrome ~360 = paddings + header + question + input + nav + countdown
-    // + editor pre-grown to 6 lines (162px): the window is fully static —
-    // runtime resizing proved unreliable (dropped resizes, stale frames), so
-    // typing grows the editor INTO the reserved space and past 6 lines the
-    // editor scrolls internally. Rows ~60 each, progress bar (multi) ~20,
-    // preview panel ~152.
-    let mut height = 360.0 + 60.0 * max_options;
-    if spec.questions.len() > 1 {
-        height += 20.0;
-    }
     if has_preview {
-        height += 152.0;
+        height += 152.0; // preview panel
     }
     window::Settings {
-        size: Size::new(WIN_W, height.clamp(300.0, 820.0)),
+        size: Size::new(WIN_W, height.clamp(300.0, 900.0)),
         // false on purpose: tiling compositors treat resizable windows as
         // tileable and blow the popup up to a full frame; non-resizable ones
-        // stay floating. The height estimate above is generous instead.
+        // stay floating. The content-aware estimate above is generous instead.
         resizable: false,
         decorations: false,
         level: window::Level::AlwaysOnTop,

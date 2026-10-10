@@ -121,6 +121,27 @@ t8_timeout() {
         '{"questions":[{"question":"Wait without touching anything.","header":"T8","options":[{"label":"A"},{"label":"B"}]}],"timeout_secs":5}'
 }
 
+t14_long_note() {
+    say "T14: long multiline note"
+    hint "pick Rust, then paste/type this 4-line note (Enter = new lines):"
+    hint "  line one with Polish chars: abcdefg"
+    hint "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    hint "  line after a long unbroken token"
+    hint "  END-OF-NOTE"
+    hint "then press Shift+Enter to send"
+    popup_test "T14 long note appended after selection" '"selections":["Rust","line one' \
+        '{"questions":[{"question":"Pick Rust and paste the long note from the hint.","header":"T14","options":[{"label":"Rust"},{"label":"C"}]}],"timeout_secs":180}'
+    check "T14 long note fully captured" 'END-OF-NOTE"' "$actual"
+}
+
+t15_long_options() {
+    say "T15: long option labels"
+    hint "both options wrap over several lines — the window must fit everything;"
+    hint "pick the Rust option, then Next"
+    popup_test "T15 long options fit + full label returned" '"selections":["Rust — memory safety without a garbage collector' \
+        '{"questions":[{"question":"Pick the Rust option (labels are intentionally long — check the window fits them all).","header":"T15","options":[{"label":"Rust — memory safety without a garbage collector, zero-cost abstractions and fearless concurrency","description":"Choice A: compiled and predictable performance; the ownership model prevents data races at compile time instead of runtime crashes."},{"label":"C — manual memory management with malloc and free, where every dangling pointer and buffer overflow is entirely your responsibility","description":"Choice B: maximum control and a tiny runtime, but use-after-free bugs are all yours to find."}]}],"timeout_secs":120}'
+}
+
 t9_e2e_serve() {
     say "T9: end-to-end through aski serve"
     hint "click 'Works', then Next — goes through the real MCP stdio path"
@@ -177,6 +198,8 @@ case "$GROUP" in
         t6_navigation
         t7_cancel
         t8_timeout
+        t14_long_note
+        t15_long_options
         t9_e2e_serve
         ;;
     server)
@@ -198,6 +221,8 @@ case "$GROUP" in
         t6_navigation
         t7_cancel
         t8_timeout
+        t14_long_note
+        t15_long_options
         t9_e2e_serve
         t10_too_many_questions
         t11_too_many_options
