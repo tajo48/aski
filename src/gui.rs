@@ -12,7 +12,7 @@
 use crate::spec::{Answer, AnswerStatus, PopupSpec, Question, QuestionAnswer};
 use crate::theme;
 use iced::alignment::Vertical;
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Id};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_editor};
 use iced::{keyboard, time, window, Border, Element, Length, Size, Subscription, Task, Theme};
 use std::io::Write;
 use std::time::Duration;
@@ -38,13 +38,9 @@ pub fn run_popup() {
 }
 
 fn try_run_popup() -> Result<(), String> {
-    // wgpu's Vulkan backend freezes after the first frame on NVIDIA proprietary
-    // drivers (events are processed but frames never present); GL renders fine.
-    // wgpu reads WGPU_BACKEND at init, so set it before iced starts — but only
-    // if the user hasn't chosen a backend themselves.
-    if std::env::var_os("WGPU_BACKEND").is_none() {
-        std::env::set_var("WGPU_BACKEND", "gl");
-    }
+    // Rendering is pure software (tiny_skia — iced built without wgpu): the
+    // NVIDIA proprietary driver dropped text layers on GL and froze frame
+    // presentation on Vulkan, so the GPU is deliberately out of the picture.
 
     let mut line = String::new();
     std::io::stdin()
@@ -57,15 +53,12 @@ fn try_run_popup() -> Result<(), String> {
     }
 
     let settings = window_settings(&spec);
-    let input_id = Id::unique();
     // BootFn needs `Fn`, so the closure clones its captures per call.
+    // Deliberately NO autofocus: the note editor is multiline, so when focused
+    // it would eat ArrowUp/Down and break keyboard option navigation.
     let boot_spec = spec.clone();
-    let boot_id = input_id.clone();
     iced::application(
-        move || {
-            let task = iced::widget::operation::focus(boot_id.clone()).into();
-            (Popup::new(boot_spec.clone(), boot_id.clone()), task)
-        },
+        move || (Popup::new(boot_spec.clone()), Task::none()),
         update,
         view,
     )
@@ -80,7 +73,6 @@ fn try_run_popup() -> Result<(), String> {
 /// Per-question answer state.
 struct QuestionState {
     selected: Vec<bool>,
-    other: String,
 }
 
 struct Popup {
@@ -92,12 +84,13 @@ struct Popup {
     /// Keyboard-focused option within the current question. Cleared on mouse
     /// clicks — the plate highlight is a keyboard aid, not a selection state.
     cursor: Option<usize>,
-    input_id: Id,
+    /// Multiline free-form note; Enter = newline, Shift+Enter sends.
+    note: text_editor::Content,
     remaining: Option<u64>,
 }
 
 impl Popup {
-    fn new(spec: PopupSpec, input_id: Id) -> Self {
+    fn new(spec: PopupSpec) -> Self {
         let flavor = spec.flavor.unwrap_or_default();
         let palette = theme::resolve(flavor, spec.accent.as_deref());
         let remaining = match spec.timeout_secs {
@@ -109,7 +102,6 @@ impl Popup {
             .iter()
             .map(|q| QuestionState {
                 selected: vec![false; q.options.len()],
-                other: String::new(),
             })
             .collect();
         Self {
@@ -118,7 +110,7 @@ impl Popup {
             states,
             current: 0,
             cursor: None,
-            input_id,
+            note: text_editor::Content::new(),
             remaining,
         }
     }
@@ -154,7 +146,8 @@ impl Popup {
     fn collect(&self, idx: usize) -> Vec<String> {
         let st = &self.states[idx];
         let q = &self.spec.questions[idx];
-        let custom = st.other.trim();
+        let text = self.note.text();
+        let custom = text.trim();
         if !custom.is_empty() {
             return vec![custom.to_string()];
         }
@@ -194,7 +187,7 @@ enum Message {
     MoveCursor(i32),
     Next,
     Back,
-    OtherChanged(String),
+    Edit(text_editor::Action),
     Tick,
     Close,
 }
@@ -264,8 +257,8 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             popup.cursor = None;
             Task::none()
         }
-        Message::OtherChanged(value) => {
-            popup.state_mut().other = value;
+        Message::Edit(action) => {
+            popup.note.perform(action);
             Task::none()
         }
         Message::Tick => match popup.remaining {
@@ -289,6 +282,30 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
 }
 
 // --------------------------------------------------------------------- view
+
+/// The note editor displays up to 6 lines (the window reserves that space
+/// statically — runtime window resizing proved unreliable: dropped resizes,
+/// stale frames); beyond 6 lines it scrolls internally. Line height 20.0
+/// measured from actual render (size 13 renders ~19.5px/line), + padding 16
+/// + border 2, + 24px slack so a fresh caret line never triggers the
+/// editor's internal scroll (its offset sticks and text renders over the
+/// border).
+fn editor_height(popup: &Popup) -> f32 {
+    const CHARS_PER_LINE: f32 = 45.0; // ~360px box at font size 13
+    const LINE_H: f32 = 20.0;
+    const CHROME: f32 = 42.0; // padding 16 + border 2 + caret-scroll slack 24
+    let visual: usize = popup
+        .note
+        .text()
+        .lines()
+        .map(|line| {
+            (line.chars().count() as f32 / CHARS_PER_LINE)
+                .ceil()
+                .max(1.0) as usize
+        })
+        .sum();
+    visual.max(1).min(6) as f32 * LINE_H + CHROME
+}
 
 fn view(popup: &Popup) -> Element<'_, Message> {
     let p = popup.palette;
@@ -334,20 +351,19 @@ fn view(popup: &Popup) -> Element<'_, Message> {
         col = col.push(preview_panel(p, preview));
     }
 
+    // Multiline note editor: Enter inserts a newline (the editor consumes
+    // the key), Shift+Enter sends — intercepted globally in `key_to_message`.
     col = col.push(
-        text_input("Other… free-form answer", &st.other)
-            .id(popup.input_id.clone())
-            .on_input(Message::OtherChanged)
-            .on_submit(Message::Next)
+        text_editor(&popup.note)
+            .id(iced::widget::Id::new("aski-note"))
+            .placeholder("Other… free-form answer")
             .size(13)
             .padding([8, 12])
-            .width(Length::Fill)
-            .style(move |_theme, status| text_input_style(p, status)),
+            .width(CONTENT_W)
+            .height(editor_height(popup))
+            .style(move |_theme, status| editor_style(p, status))
+            .on_action(Message::Edit),
     );
-
-    // Push the nav row (and countdown) to the bottom edge, whatever the
-    // height estimate left over.
-    col = col.push(container(text("")).height(Length::Fill));
 
     col = col.push(nav_bar(p, popup.current > 0, last));
 
@@ -646,20 +662,18 @@ fn primary_style(p: theme::Palette, status: button::Status) -> button::Style {
     }
 }
 
-fn text_input_style(p: theme::Palette, status: text_input::Status) -> text_input::Style {
-    let border_color = if matches!(status, text_input::Status::Focused { .. }) {
-        p.accent
-    } else {
-        p.surface1
+fn editor_style(p: theme::Palette, status: text_editor::Status) -> text_editor::Style {
+    let border_color = match status {
+        text_editor::Status::Focused { .. } => p.accent,
+        _ => p.surface1,
     };
-    text_input::Style {
+    text_editor::Style {
         background: p.mantle.into(),
         border: Border {
             radius: 8.0.into(),
             width: 1.0,
             color: border_color,
         },
-        icon: p.overlay0,
         placeholder: p.overlay0,
         value: p.text,
         selection: p.accent,
@@ -671,8 +685,10 @@ fn text_input_style(p: theme::Palette, status: text_input::Status) -> text_input
 fn subscription(popup: &Popup) -> Subscription<Message> {
     let mut subs = vec![
         window::close_requests().map(|_| Message::Close),
-        iced::event::listen_with(|event, _status, _id| match event {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => key_to_message(key),
+        iced::event::listen_with(|event, status, _id| match event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                key_to_message(key, modifiers, status)
+            }
             _ => None,
         }),
     ];
@@ -682,16 +698,24 @@ fn subscription(popup: &Popup) -> Subscription<Message> {
     Subscription::batch(subs)
 }
 
-// Character keys are deliberately NOT handled here: they must reach the
-// "Other…" text input untouched. Up/Down are no-ops in a single-line input,
-// so they are safe to repurpose as option-cursor navigation.
-fn key_to_message(key: keyboard::Key) -> Option<Message> {
+// Character keys are never handled here — they must reach the note editor.
+// `status` tells us whether a widget (the focused editor) already consumed
+// the key: if it did, we stay out of the way (Enter = newline, arrows = caret).
+// While typing, Shift+Enter is the explicit "send" — it fires regardless of
+// focus, so the stray newline the editor inserts is discarded with the process.
+fn key_to_message(
+    key: keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    status: iced::event::Status,
+) -> Option<Message> {
     use keyboard::key::Named;
+    let ignored = matches!(status, iced::event::Status::Ignored);
     match key {
         keyboard::Key::Named(Named::Escape) => Some(Message::Close),
-        keyboard::Key::Named(Named::Enter) => Some(Message::Next),
-        keyboard::Key::Named(Named::ArrowUp) => Some(Message::MoveCursor(-1)),
-        keyboard::Key::Named(Named::ArrowDown) => Some(Message::MoveCursor(1)),
+        keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::Next),
+        keyboard::Key::Named(Named::Enter) if ignored => Some(Message::Next),
+        keyboard::Key::Named(Named::ArrowUp) if ignored => Some(Message::MoveCursor(-1)),
+        keyboard::Key::Named(Named::ArrowDown) if ignored => Some(Message::MoveCursor(1)),
         _ => None,
     }
 }
@@ -707,14 +731,18 @@ fn window_settings(spec: &PopupSpec) -> window::Settings {
         .questions
         .iter()
         .any(|q| q.options.iter().any(|o| o.preview.is_some()));
-    // header+question 88, rows ~52 each, input 40, nav 38, paddings 36,
-    // progress bar (multi) 16, preview panel 148, countdown 16
-    let mut height = 188.0 + 52.0 * max_options;
+    // Chrome ~360 = paddings + header + question + input + nav + countdown
+    // + editor pre-grown to 6 lines (162px): the window is fully static —
+    // runtime resizing proved unreliable (dropped resizes, stale frames), so
+    // typing grows the editor INTO the reserved space and past 6 lines the
+    // editor scrolls internally. Rows ~60 each, progress bar (multi) ~20,
+    // preview panel ~152.
+    let mut height = 360.0 + 60.0 * max_options;
     if spec.questions.len() > 1 {
-        height += 16.0;
+        height += 20.0;
     }
     if has_preview {
-        height += 148.0;
+        height += 152.0;
     }
     window::Settings {
         size: Size::new(WIN_W, height.clamp(300.0, 820.0)),

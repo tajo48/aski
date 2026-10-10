@@ -88,7 +88,7 @@ t3_multi_select() {
 
 t4_other() {
     say "T4: free-form answer"
-    hint "type 'my own answer' into Other and press Enter (ignore the predefined options)"
+    hint "type 'my own answer' into Other (Enter adds lines only), then press Shift+Enter to send"
     popup_test "T4 Other free-form" '"selections":["my own answer"]' \
         '{"questions":[{"question":"Type a custom answer in the Other field.","header":"T4","options":[{"label":"A"},{"label":"B"}]}],"timeout_secs":120}'
 }
