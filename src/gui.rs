@@ -191,7 +191,6 @@ enum Message {
     MoveCursor(i32),
     Next,
     SelectCursor,
-    SubmitAll,
     Back,
     Edit(text_editor::Action),
     Tick,
@@ -243,30 +242,23 @@ fn update(popup: &mut Popup, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SelectCursor => {
-            // Enter: apply click semantics to the highlighted option —
-            // single-select marks it, multi-select toggles the tick.
+            // Enter (keyboard): apply click semantics to the highlighted
+            // option — single-select marks it, multi-select toggles the tick
+            // — but KEEP the plate: the highlight dies only on mouse clicks.
             if let Some(i) = popup.cursor {
+                popup.plate = true;
                 if popup.question().multi_select {
-                    let ticked = popup.state().selected.get(i).copied().unwrap_or(false);
-                    return update(popup, Message::Toggle(i, !ticked));
+                    if let Some(slot) = popup.state_mut().selected.get_mut(i) {
+                        *slot = !*slot;
+                    }
+                } else {
+                    let st = popup.state_mut();
+                    for (j, slot) in st.selected.iter_mut().enumerate() {
+                        *slot = j == i;
+                    }
                 }
-                return update(popup, Message::Select(i));
             }
             Task::none()
-        }
-        Message::SubmitAll => {
-            // Shift+Enter: send everything collected so far, from any page.
-            let answers = (0..popup.spec.questions.len())
-                .map(|i| QuestionAnswer {
-                    header: popup.spec.questions[i].header.clone(),
-                    selections: popup.collect(i),
-                })
-                .collect();
-            finish(Answer {
-                status: AnswerStatus::Answered,
-                answers,
-                error: None,
-            });
         }
         Message::Back => {
             if popup.current > 0 {
@@ -763,7 +755,7 @@ fn key_to_message(
     let ignored = matches!(status, iced::event::Status::Ignored);
     match key {
         keyboard::Key::Named(Named::Escape) => Some(Message::Close),
-        keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::SubmitAll),
+        keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::Next),
         keyboard::Key::Named(Named::Enter) if ignored => Some(Message::SelectCursor),
         keyboard::Key::Named(Named::ArrowUp) if ignored => Some(Message::MoveCursor(-1)),
         keyboard::Key::Named(Named::ArrowDown) if ignored => Some(Message::MoveCursor(1)),
